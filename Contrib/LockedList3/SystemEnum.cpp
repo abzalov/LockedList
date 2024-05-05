@@ -224,6 +224,8 @@ static BOOL SystemFuncInit()
     GetModuleFileNameEx       == NULL
      )
   {
+    OutputDebugMessage(TEXT("Initialize system functions"));
+
     HINSTANCE hDll;
 
     hDll = GetModuleHandle(TEXT("ntdll.dll"));
@@ -459,7 +461,7 @@ static void RevertFileSystemRedirection(PVOID pOldValue)
     Wow64RevertWow64FsRedirection(pOldValue);
 }
 
-static BOOL QueryHandleInfo(LPTHREAD_START_ROUTINE lpProc, NTFUNC_THREAD_PARAMS* pParams)
+static BOOL QueryHandleInfo(LPTHREAD_START_ROUTINE lpProc, NTFUNC_THREAD_PARAMS* pParams, LPCTSTR szSender, LPCTSTR szTag)
 {
   HANDLE hThread = CreateThread(NULL, 0, lpProc, pParams, 0, NULL);
 
@@ -467,12 +469,19 @@ static BOOL QueryHandleInfo(LPTHREAD_START_ROUTINE lpProc, NTFUNC_THREAD_PARAMS*
   {
     // Terminate threads that are frozen.
     if (WaitForSingleObject(hThread, 300) == WAIT_TIMEOUT)
+    {
+      OutputDebugMessagef(TEXT("Warning: %s thread freezed - terminating -> %s"), szTag, szSender);
       TerminateThread(hThread, 0);
+    }
     CloseHandle(hThread);
     return TRUE;
   }
   else
+  {
+    OutputDebugMessagef(TEXT("Error: %s - CreateThread failed -> %s"), szTag, szSender);
+
     return FALSE;
+  }
 }
 
 // Gets a full file path from a file handle.
@@ -485,6 +494,10 @@ static BOOL GetHandleFilePath(HANDLE h, USHORT typeIndex, FILE_INFORMATION* file
   // Also skip services.exe.
   if (!EndsWith(file->ProcessFullPath, TEXT("\\mdm.exe")) && !EndsWith(file->ProcessFullPath, TEXT("\\services.exe")))
   {
+    TCHAR szSender[1024];
+    wsprintf(szSender, TEXT("%s, handle: 0x%08X"), file->ProcessFullPath, h);
+    //OutputDebugMessage(szSender);
+
     BOOL fRemote = file->ProcessId != GetCurrentProcessId();
     HANDLE hRemoteProcess = NULL;
     HANDLE hHandle = NULL;
@@ -521,7 +534,7 @@ static BOOL GetHandleFilePath(HANDLE h, USHORT typeIndex, FILE_INFORMATION* file
         //don't try get file type in the current thread:
         //  NtQueryObject, NtQueryVolumeInformationFile and GetFileType - all freezes on some magic handle type
         //  clearly reproduced on Windows XP, but others OS are not excluded
-        if (QueryHandleInfo(NtQueryObjectThread, &threadParams)
+        if (QueryHandleInfo(NtQueryObjectThread, &threadParams, szSender, TEXT("NtQueryObjectThread (get type)"))
           && *threadParams.OutBuffer) // The buffer is not empty
         {
           pszTypeName = threadParams.OutBuffer;
@@ -531,16 +544,19 @@ static BOOL GetHandleFilePath(HANDLE h, USHORT typeIndex, FILE_INFORMATION* file
         }
       }
 
+      if (pszTypeName == NULL || lstrlen(pszTypeName) == 0)
+      {
+        OutputDebugMessagef(TEXT("Warning: Handle type is unknown -> %s"), szSender);
+      }
       // Only want files and directories!
-      if (pszTypeName != NULL
-        && (lstrcmpi(pszTypeName, TEXT("File")) == 0 || lstrcmpi(pszTypeName, TEXT("Directory")) == 0))
+      else if (lstrcmpi(pszTypeName, TEXT("File")) == 0 || lstrcmpi(pszTypeName, TEXT("Directory")) == 0)
       {
         // First try using NtQueryInformationFile which does not freeze when it doesn't get access
         // but instead returns an empty string as the file name.
         ZeroMemory(threadParams.Buffer, threadParams.BufferLength);
         ZeroMemory(threadParams.OutBuffer, threadParams.OutBufferLength);
 
-        if (QueryHandleInfo(NtQueryInformationFileThread, &threadParams)
+        if (QueryHandleInfo(NtQueryInformationFileThread, &threadParams, szSender, TEXT("NtQueryInformationFileThread"))
           && *threadParams.OutBuffer) // The buffer is not empty
         {
           // Get the full device path for the file now that we know we have access.
@@ -548,7 +564,7 @@ static BOOL GetHandleFilePath(HANDLE h, USHORT typeIndex, FILE_INFORMATION* file
           ZeroMemory(threadParams.Buffer, threadParams.BufferLength);
           ZeroMemory(threadParams.OutBuffer, threadParams.OutBufferLength);
 
-          if (QueryHandleInfo(NtQueryObjectThread, &threadParams)
+          if (QueryHandleInfo(NtQueryObjectThread, &threadParams, szSender, TEXT("NtQueryObjectThread (get name)"))
             && *threadParams.OutBuffer) // The buffer is not empty
           {
             ZeroMemory(file->FullPath, sizeof(file->FullPath));
@@ -604,13 +620,18 @@ static SYSTEM_HANDLE_INFORMATION_EX* GetSystemHandleInformation()
   ULONG bufferSize;
   NTSTATUS status;
 
+  OutputDebugMessage(TEXT("GetSystemHandleInformation started"));
+
   if (!SystemFuncInit())
     return NULL;
 
   bufferSize = 0x10000;
   buffer = GlobalAlloc(GPTR, bufferSize);
   if (buffer == NULL)
+  {
+    OutputDebugMessagef(TEXT("Error: Allocating memory failed: %u"), bufferSize);
     return NULL;
+  }
 
   while ((status = NtQuerySystemInformation(SystemExtendedHandleInformation,
     buffer, bufferSize, NULL)) == STATUS_INFO_LENGTH_MISMATCH)
@@ -620,18 +641,27 @@ static SYSTEM_HANDLE_INFORMATION_EX* GetSystemHandleInformation()
 
     // Fail if we're resizing the buffer to something very large.
     if (bufferSize > MAX_BUFFER_SIZE)
+    {
+      OutputDebugMessage(TEXT("Error: Buffer size is exceeded MAX_BUFFER_SIZE - break"));
       return NULL;
+    }
 
     buffer = GlobalAlloc(GPTR, bufferSize);
     if (buffer == NULL)
+    {
+      OutputDebugMessagef(TEXT("Error: Allocating memory failed: %u"), bufferSize);
       return NULL;
+    }
   }
 
   if (!NT_SUCCESS(status))
   {
     GlobalFree(buffer);
+    OutputDebugMessagef(TEXT("Error: NtQuerySystemInformation failed: 0x%08X"), status);
     return NULL;
   }
+
+  OutputDebugMessage(TEXT("GetSystemHandleInformation completed"));
 
   return (SYSTEM_HANDLE_INFORMATION_EX*)buffer;
 }
@@ -761,6 +791,8 @@ ULONG WINAPI GetSystemHandlesCount()
     count = 0;
   }
 
+  OutputDebugMessagef(TEXT("Number of system handles: %u"), count);
+
   return count;
 }
 
@@ -769,6 +801,8 @@ BOOL WINAPI EnumSystemHandles(ENUM_FILES lpEnumFiles, ENUM_OPTIONS* pOpt)
   FILE_INFORMATION file;
   DWORD dwProcessIdLast = -1;
   BOOL bOpenProcessSuccessLast = FALSE;
+
+  OutputDebugMessage(TEXT("Enumeration of system handles started"));
 
   SYSTEM_HANDLE_INFORMATION_EX* pSysHandleInformation = GetSystemHandleInformation();
   if (pSysHandleInformation == NULL)
@@ -802,6 +836,7 @@ BOOL WINAPI EnumSystemHandles(ENUM_FILES lpEnumFiles, ENUM_OPTIONS* pOpt)
       // Call the callback.
       if (!lpEnumFiles(file, pOpt->lParam))
       {
+        OutputDebugMessage(TEXT("Warning: Enumeration of system handles aborted by callback"));
         bAbort = TRUE;
         break;
       }
@@ -810,12 +845,18 @@ BOOL WINAPI EnumSystemHandles(ENUM_FILES lpEnumFiles, ENUM_OPTIONS* pOpt)
     // Exit right now?
     if (WaitForSingleObject(g_hFinishNow, 0) != WAIT_TIMEOUT)
     {
+      OutputDebugMessage(TEXT("Warning: Enumeration of system handles aborted by cancel event"));
       bAbort = TRUE;
       break;
     }
+
+    if (i % 5000 == 0)
+      OutputDebugMessagef(TEXT("Enumeration of system handles: processed: %u/%u"), i, pSysHandleInformation->NumberOfHandles);
   }
 
   RevertFileSystemRedirection(pOldValue);
+
+  OutputDebugMessage(TEXT("Enumeration of system handles completed"));
 
   GlobalFree(pSysHandleInformation);
   return bAbort ? FALSE : TRUE;
@@ -853,6 +894,8 @@ UINT WINAPI GetSystemModulesCount()
   {
     count = 0;
   }
+
+  OutputDebugMessagef(TEXT("Number of system modules: %u"), count);
 
   return count;
 }
@@ -908,6 +951,7 @@ static void EnumProcessModulesWithCallback(HANDLE hProcess, FILE_INFORMATION *pf
       // Call the callback.
       if (!lpEnumFiles(*pfile, pOpt->lParam))
       {
+        OutputDebugMessage(TEXT("Warning: Enumeration of process modules aborted by callback"));
         *pbAbort = TRUE;
         break;
       }
@@ -916,6 +960,7 @@ static void EnumProcessModulesWithCallback(HANDLE hProcess, FILE_INFORMATION *pf
     // Exit right now?
     if (WaitForSingleObject(g_hFinishNow, 0) != WAIT_TIMEOUT)
     {
+      OutputDebugMessage(TEXT("Warning: Enumeration of process modules aborted by cancel event"));
       *pbAbort = TRUE;
       break;
     }
@@ -926,6 +971,8 @@ static void EnumProcessModulesWithCallback(HANDLE hProcess, FILE_INFORMATION *pf
 
 BOOL WINAPI EnumSystemProcesses(ENUM_FILES lpEnumFiles, ENUM_OPTIONS* pOpt, BOOL fEnumModules)
 {
+  OutputDebugMessage(TEXT("Enumeration of system processes started"));
+
   DWORD size = 0;
   DWORD* pdwProcessIds = GetProcessIds(&size);
   if (pdwProcessIds == NULL)
@@ -951,6 +998,7 @@ BOOL WINAPI EnumSystemProcesses(ENUM_FILES lpEnumFiles, ENUM_OPTIONS* pOpt, BOOL
     // Call the callback.
     if (!lpEnumFiles(file, pOpt->lParam))
     {
+      OutputDebugMessage(TEXT("Warning: Enumeration of system processes aborted by callback"));
       bAbort = TRUE;
       break;
     }
@@ -970,6 +1018,7 @@ BOOL WINAPI EnumSystemProcesses(ENUM_FILES lpEnumFiles, ENUM_OPTIONS* pOpt, BOOL
     // Exit right now?
     if (WaitForSingleObject(g_hFinishNow, 0) != WAIT_TIMEOUT)
     {
+      OutputDebugMessage(TEXT("Warning: Enumeration of system processes aborted by cancel event"));
       bAbort = TRUE;
       break;
     }
@@ -978,6 +1027,9 @@ BOOL WINAPI EnumSystemProcesses(ENUM_FILES lpEnumFiles, ENUM_OPTIONS* pOpt, BOOL
   RevertFileSystemRedirection(pOldValue);
 
   GlobalFree(pdwProcessIds);
+
+  OutputDebugMessage(TEXT("Enumeration of system processes completed"));
+
   return bAbort ? FALSE : TRUE;
 }
 

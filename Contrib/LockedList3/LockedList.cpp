@@ -295,6 +295,8 @@
 HINSTANCE   g_hInstance;
 BOOL        g_fDebugPrivEnabled = FALSE;
 
+INT         g_OutputDebugCallbackFunctionAddress = 0;
+
 // Ensures the NSIS installer has debug privileges.
 static BOOL EnableDebugPriv()
 {
@@ -582,8 +584,10 @@ BOOL CALLBACK EnumProcessIdsProc(DWORD dwProcessId, LPARAM lParam)
 }
 
 // Closes an application.
-static void CloseApplication(HWND hWnd)
+static void CloseApplication(DWORD dwProcessId, HWND hWnd)
 {
+  OutputDebugMessagef(TEXT("Warning: Trying to close application by WM_CLOSE: %u"), dwProcessId);
+
   SetActiveWindow(hWnd);
   SendMessageTimeout(hWnd, WM_CLOSE, 0, 0, SMTO_ABORTIFHUNG | SMTO_BLOCK, 1000, 0);
 }
@@ -594,6 +598,8 @@ static void KillApplication(DWORD dwProcessId)
   HANDLE hProcess = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, dwProcessId);
   if (hProcess != NULL)
   {
+    OutputDebugMessagef(TEXT("Warning: Trying to close application by TerminateProcess: %u"), dwProcessId);
+
     TerminateProcess(hProcess, 0xFFFFFFFF);
     WaitForSingleObject(hProcess, 1000);
     CloseHandle(hProcess);
@@ -751,7 +757,7 @@ static LRESULT CALLBACK DlgProc(HWND hWndDlg, UINT uMsg, WPARAM wParam, LPARAM l
       if (sel == 1)
       {
         if (IsWindow(pListItemInfoProcess->hWnd))
-          CloseApplication(pListItemInfoProcess->hWnd);
+          CloseApplication(pListItemInfoProcess->dwProcessId, pListItemInfoProcess->hWnd);
       }
       // Copy list to clipboard.
       else if (sel == 2)
@@ -900,6 +906,8 @@ static BOOL AddProcess(DWORD dwProcessId, PTCHAR pszProcess)
 // Invoke the callback function. Returns TRUE if enumeration should continue; FALSE otherwise.
 static BOOL AddItem(const PTCHAR pszProcessDescription, const PTCHAR pszProcessFullPath, int iFunctionAddress, LISTITEM_INFO* pListItemInfo)
 {
+  OutputDebugMessagef(TEXT("Locking application found: %s"), pszProcessFullPath);
+
   if (pListItemInfo->listItemType != ListItemProcess || AddProcess(((LISTITEM_INFO_PROCESS*)pListItemInfo->lpData)->dwProcessId))
   {
     BOOL bResult = FALSE;
@@ -916,6 +924,7 @@ static BOOL AddItem(const PTCHAR pszProcessDescription, const PTCHAR pszProcessF
       if (lstrcmpi(pszParam, TEXT("true")) == 0)
       {
         bResult = TRUE;
+        OutputDebugMessage(TEXT("Locking application should be skipped (response from callback)"));
       }
       // Auto close process and then continue.
       else if (lstrcmpi(pszParam, TEXT("autoclose")) == 0)
@@ -934,7 +943,7 @@ static BOOL AddItem(const PTCHAR pszProcessDescription, const PTCHAR pszProcessF
             BOOL fIsWindow;
             if (iAutoClose == 0 && (fIsWindow = IsWindow(pListItemInfoProcess->hWnd)))
             {
-              CloseApplication(pListItemInfoProcess->hWnd);
+              CloseApplication(pListItemInfoProcess->dwProcessId, pListItemInfoProcess->hWnd);
               iAutoClose = 1;
               Sleep(2000);
             }
@@ -947,6 +956,8 @@ static BOOL AddItem(const PTCHAR pszProcessDescription, const PTCHAR pszProcessF
             // Auto close failed.
             else
             {
+              OutputDebugMessagef(TEXT("Warning: Auto close of locking application failed: %u"), pListItemInfoProcess->dwProcessId);
+
               pushstring(pszProcessDescription);
               pushstring(pszProcessFullPath);
               pushstring(TEXT("-1"));
@@ -1115,7 +1126,7 @@ BOOL CALLBACK CloseProcessProc(FILE_INFORMATION& file, LPARAM lParam)
     if (pstArgs->fYesNo)
       KillApplication(file.ProcessId);
     else
-      CloseApplication(file.ProcessHWND);
+      CloseApplication(file.ProcessId, file.ProcessHWND);
 
     pstArgs->fSuccess = TRUE;
   }
@@ -1618,7 +1629,7 @@ DWORD WINAPI FilesThread(LPVOID)
             ListView_GetItem(g_hList, &lvi);
             LISTITEM_INFO_PROCESS* pListItemInfoProcess = GetListItemInfoProcess(lvi.lParam);
             if (pListItemInfoProcess != NULL && IsWindow(pListItemInfoProcess->hWnd))
-              CloseApplication(pListItemInfoProcess->hWnd);
+              CloseApplication(pListItemInfoProcess->dwProcessId, pListItemInfoProcess->hWnd);
           }
           BreakableSleep(EndProgramMonitoringRequested(), 1000, 10);
           g_fAutoClosing = 2;
@@ -2597,6 +2608,27 @@ NSISFUNC(EnumProcesses)
   GlobalFree(pszParam);
 }
 
+NSISFUNC(SetOutputDebugCallback)
+{
+  EXDLL_INIT();
+
+  PTCHAR pszParam = (PTCHAR)GlobalAlloc(GPTR, sizeof(TCHAR) * string_size);
+
+  if (popstring(pszParam) == 0)
+  {
+    g_pExtraParameters = extra;
+    g_OutputDebugCallbackFunctionAddress = myatoi(pszParam) - 1;
+
+    OutputDebugMessagef(TEXT("OutputDebugCallback installed: %s"), g_OutputDebugCallbackFunctionAddress > 0 ? TEXT("True") : TEXT("False"));
+
+    pushstring(OUT_OK);
+  }
+  else
+    pushstring(OUT_ERROR);
+
+  GlobalFree(pszParam);
+}
+
 #endif //_WIN64
 
 // Entry point for DLL.
@@ -2722,6 +2754,9 @@ static UINT GetSystemModulesCount64()
 
   g_uGetSystemModulesCount64 = 0;
   CallLockedList64(TEXT("GetSystemModulesCount64"), TEXT(""));
+
+  OutputDebugMessagef(TEXT("Number of 64-bit modules: %u"), g_uGetSystemModulesCount64);
+
   return g_uGetSystemModulesCount64;
 }
 
@@ -2764,8 +2799,16 @@ static BOOL CallLockedList64(PTCHAR pszFunction, PTCHAR pszArguments)
   //-- the caller doesn't want x64 support?
   LPCTSTR szPlugin64Name = TEXT("LockedList64.dll");
   PathAppend(szThisFilePath, szPlugin64Name);
+
+  OutputDebugMessagef(TEXT("Checking for existence LockedList64.dll: %s"), szThisFilePath);
+
   if (!PathFileExists(szThisFilePath))
+  {
+    OutputDebugMessage(TEXT("Warning: LockedList64.dll does not exists - enumeration of 64-bit modules disabled"));
     return TRUE;
+  }
+
+  OutputDebugMessage(TEXT("LockedList64.dll found - using it"));
 
   //-- create a callback window: we will be getting found files using it (one by one).
   HWND hCallbackWindow = CreateWindow(TEXT("STATIC"), TEXT("LockedList x64 Checker"), WS_POPUP, 0, 0, 100, 100, HWND_MESSAGE, NULL, g_hInstance, NULL);
@@ -2789,6 +2832,8 @@ static BOOL CallLockedList64(PTCHAR pszFunction, PTCHAR pszArguments)
   sei.lpDirectory = szThisFilePath;
   sei.nShow = SW_HIDE;
 
+  OutputDebugMessagef(TEXT("Starting rundll32.exe %s"), pszParams);
+
   if (ShellExecuteEx(&sei) && sei.hProcess)
   {
     //-- for the process end but handle all the thread messages (to make the callback window working).
@@ -2811,7 +2856,11 @@ static BOOL CallLockedList64(PTCHAR pszFunction, PTCHAR pszArguments)
     }
 
     CloseHandle(sei.hProcess);
+
+    OutputDebugMessage(TEXT("rundll32.exe completed"));
   }
+  else
+    OutputDebugMessage(TEXT("Error: rundll32.exe failed to start"));
 
   if (IsWindow(hCallbackWindow))
   {
@@ -2870,3 +2919,34 @@ LRESULT CALLBACK CallbackWindow64WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LP
 }
 
 #endif //end of not _WIN64 code.
+
+void OutputDebugMessage(const LPCTSTR szMessage)
+{
+  OutputDebugString(szMessage);
+  OutputDebugString(TEXT("\r\n"));
+
+#ifndef _WIN64
+  if (g_OutputDebugCallbackFunctionAddress > 0)
+  {
+    pushstring(szMessage);
+    g_pExtraParameters->ExecuteCodeSegment(g_OutputDebugCallbackFunctionAddress, g_hWndParent);
+  }
+#endif
+}
+
+void OutputDebugMessagef(const LPCTSTR szFormat, ...)
+{
+  va_list args;
+
+  PTCHAR szMessage = (PTCHAR)GlobalAlloc(GPTR, sizeof(TCHAR) * g_stringsize);
+  if (szMessage != NULL)
+  {
+    va_start(args, szFormat);
+    wsprintf(szMessage, szFormat, args);
+    va_end(args);
+
+    OutputDebugMessage(szMessage);
+
+    GlobalFree(szMessage);
+  }
+}

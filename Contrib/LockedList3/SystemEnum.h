@@ -81,4 +81,7 @@ BOOL EndsWith(const PTCHAR, const PTCHAR);
 BOOL StartsWith(const PTCHAR, const PTCHAR);
 BOOL IsRunningX64();
 
+void OutputDebugMessage(const LPCTSTR);
+void OutputDebugMessagef(const LPCTSTR, ...);
+
 #endif
